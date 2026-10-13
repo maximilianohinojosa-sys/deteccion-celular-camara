@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Detector de celulares</title>
+<style>
+  :root{--bg:#EDEEE8;--fg:#26405B;--accent:#FF6A13;--card:#fff;--muted:#5b6b7b;--ok:#1b8a4b}
+  @media (prefers-color-scheme:dark){:root{--bg:#14202c;--fg:#e8edf2;--card:#1d2d3d;--muted:#9fb0c0}}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+  main{max-width:960px;margin:0 auto;padding:16px}
+  h1{font-size:1.4rem;margin:8px 0 4px}
+  p.sub{margin:0 0 12px;color:var(--muted);font-size:.95rem}
+  .stage{position:relative;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:4/3}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+  .mirror video,.mirror canvas{transform:scaleX(-1)}
+  .badge{position:absolute;top:10px;left:10px;padding:6px 12px;border-radius:999px;font-weight:600;font-size:.9rem;background:rgba(0,0,0,.65);color:#fff;z-index:2}
+  .badge.on{background:var(--accent)}
+  .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:12px 0}
+  button,select{font:inherit;padding:9px 14px;border-radius:8px;border:1px solid var(--fg);background:var(--card);color:var(--fg)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button:disabled{opacity:.5}
+  label{display:flex;gap:8px;align-items:center;font-size:.9rem}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+  .card{background:var(--card);border-radius:10px;padding:10px 12px}
+  .card b{display:block;font-size:1.4rem}
+  .card span{color:var(--muted);font-size:.85rem}
+  #msg{min-height:1.4em;color:var(--muted);font-size:.9rem}
+  footer{margin:16px 0;color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<main>
+  <h1>Detector de celulares con cámara</h1>
+  <p class="sub">Detecta teléfonos móviles en vivo con IA. Todo corre en tu navegador: el video no se envía ni se guarda en ningún servidor.</p>
+
+  <div class="stage mirror" id="stage">
+    <span class="badge" id="badge">Cámara apagada</span>
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="bar">
+    <button class="primary" id="start">Iniciar cámara</button>
+    <button id="stop" disabled>Detener</button>
+    <select id="camera" aria-label="Cámara"></select>
+    <label>Confianza mínima <input type="range" id="thr" min="20" max="90" value="50"> <span id="thrv">50%</span></label>
+    <label><input type="checkbox" id="mirror" checked> Espejo</label>
+  </div>
+  <div id="msg" role="status"></div>
+
+  <div class="stats">
+    <div class="card"><b id="count">0</b><span>celulares ahora</span></div>
+    <div class="card"><b id="best">–</b><span>mayor confianza</span></div>
+    <div class="card"><b id="fps">–</b><span>cuadros por segundo</span></div>
+    <div class="card"><b id="total">0</b><span>cuadros con celular</span></div>
+  </div>
+
+  <footer>Modelo: COCO-SSD (clase «cell phone») con TensorFlow.js. Funciona con la cámara del equipo; requiere HTTPS o localhost.
+  Detecta teléfonos en general, no identifica personas ni modelos.</footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+let model = null, stream = null, running = false, framesWithPhone = 0, lastT = 0, fpsAvg = 0;
+
+function say(t){ $('msg').textContent = t; }
+function badge(t,on){ $('badge').textContent = t; $('badge').classList.toggle('on', !!on); }
+
+$('thr').oninput = () => $('thrv').textContent = $('thr').value + '%';
+$('mirror').onchange = () => $('stage').classList.toggle('mirror', $('mirror').checked);
+
+async function listCameras(){
+  try{
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    const sel = $('camera'); const cur = sel.value; sel.innerHTML = '';
+    devs.forEach((d,i) => { const o = document.createElement('option'); o.value = d.deviceId; o.textContent = d.label || ('Cámara ' + (i+1)); sel.appendChild(o); });
+    if (cur) sel.value = cur;
+  }catch(e){}
+}
+
+async function start(){
+  $('start').disabled = true;
+  try{
+    if (!model){ say('Cargando modelo de IA (primera vez puede tardar unos segundos)…'); model = await cocoSsd.load({base:'lite_mobilenet_v2'}); }
+    say('Solicitando acceso a la cámara…');
+    const id = $('camera').value;
+    stream = await navigator.mediaDevices.getUserMedia({video: id ? {deviceId:{exact:id}} : {facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}, audio:false});
+    video.srcObject = stream; await video.play();
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    await listCameras();
+    running = true; $('stop').disabled = false; badge('Buscando…', false); say('');
+    requestAnimationFrame(loop);
+  }catch(e){
+    $('start').disabled = false;
+    say(e && e.name === 'NotAllowedError' ? 'Permiso de cámara denegado. Habilítalo en el navegador y reintenta.'
+        : 'No se pudo iniciar: ' + (e && e.message ? e.message : e));
+  }
+}
+
+function stop(){
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  video.srcObject = null; ctx.clearRect(0,0,canvas.width,canvas.height);
+  $('start').disabled = false; $('stop').disabled = true; badge('Cámara apagada', false);
+  $('count').textContent = '0'; $('best').textContent = '–'; $('fps').textContent = '–';
+}
+
+async function loop(){
+  if (!running) return;
+  const t0 = performance.now();
+  let preds = [];
+  try{ preds = await model.detect(video, 20, 0.2); }catch(e){}
+  const thr = $('thr').value / 100;
+  const phones = preds.filter(p => p.class === 'cell phone' && p.score >= thr);
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.lineWidth = Math.max(3, canvas.width/300); ctx.font = Math.max(16, canvas.width/40) + 'px system-ui';
+  phones.forEach(p => {
+    const [x,y,w,h] = p.bbox, label = 'Celular ' + Math.round(p.score*100) + '%';
+    ctx.strokeStyle = '#FF6A13'; ctx.strokeRect(x,y,w,h);
+    const tw = ctx.measureText(label).width + 12, th = parseInt(ctx.font) + 8, ty = Math.max(0, y - th);
+    ctx.fillStyle = '#FF6A13'; ctx.fillRect(x, ty, tw, th);
+    ctx.fillStyle = '#fff'; ctx.fillText(label, x + 6, ty + th - 8);
+  });
+
+  $('count').textContent = phones.length;
+  $('best').textContent = phones.length ? Math.round(Math.max(...phones.map(p => p.score))*100) + '%' : '–';
+  if (phones.length){ framesWithPhone++; $('total').textContent = framesWithPhone; }
+  badge(phones.length ? ('Celular detectado (' + phones.length + ')') : 'Buscando…', phones.length > 0);
+
+  const dt = performance.now() - t0; fpsAvg = fpsAvg ? fpsAvg*0.9 + (1000/dt)*0.1 : 1000/dt;
+  $('fps').textContent = fpsAvg.toFixed(1);
+  requestAnimationFrame(loop);
+}
+
+$('start').onclick = start; $('stop').onclick = stop;
+$('camera').onchange = () => { if (running){ stop(); start(); } };
+if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) say('Este navegador no permite acceder a la cámara.');
+</script>
+</body>
+</html>
